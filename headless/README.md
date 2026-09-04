@@ -8,12 +8,15 @@ The headless runtime intentionally implements only the REST contract DMCMS Drama
 
 - `GET /api/v1/health`
 - authenticated `GET /api/v1/files`
-- authenticated `POST /api/v1/files`
+- authenticated `POST /api/v1/files` for legacy single-file compatibility
+- authenticated `POST /api/v1/files/chunks` for raw bounded chunk streaming
 - authenticated `GET /api/v1/files/{message_id}`
 - authenticated `DELETE /api/v1/files/{message_id}`
 - authenticated `GET /api/v1/files/{message_id}/download` with HTTP byte ranges
 
-It does not run Tauri, React, WebDAV, sync, supporter UI, thumbnail generation, encrypted-drive objects, transcoding, or public sharing. DMCMS already owns ingest/FFmpeg lifecycle; this service only persists and streams the final Drama rendition bytes through Telegram.
+It does not run Tauri, React, WebDAV, sync, supporter UI, thumbnail generation, encrypted-drive objects, transcoding, or public sharing. New Drama uploads are not staged or transcoded by DMCMS: the browser sends bounded chunks to DMCMS, DMCMS streams each chunk to `/files/chunks`, and this service immediately stores that chunk as an ordinary Telegram document.
+
+`POST /files/chunks` is an AIVaults headless extension, not part of the stock desktop REST API. It requires `Content-Length`, accepts at most 64 MiB per request, reads the raw body as a stream, and does not create a temporary file in the headless container.
 
 ## Production topology
 
@@ -101,11 +104,15 @@ Save, then click **Test Telegram Drive**. DMCMS stores the URL/key as encrypted 
 
 Leaving `folder_id` blank stores Drama files in Saved Messages, which is the simplest production mode and the recommended default for the initial Drama Short deployment. Numeric channel/chat IDs are supported through Telegram dialog discovery if a site later needs a dedicated destination.
 
-## Limits
+## Direct Drama upload and limits
 
-Telegram currently limits this upload path to `2,000,000,000` bytes per file. DMCMS Drama enforces the same rendition limit before calling this service.
+DMCMS Drama currently splits a logical MP4 into 32 MiB chunks. Every chunk becomes one Telegram document and is far below Telegram's per-file limit. The ordered Telegram message IDs and sizes are stored by DMCMS as a provider manifest, and the public playback gateway maps a logical browser byte range onto the required Telegram chunk ranges.
 
-The service stores ordinary Telegram documents, not Telegram-Drive encrypted `.tdenc` objects, because DMCMS needs efficient browser HTTP Range playback through its stable playback gateway.
+Because the provider limit applies to each stored chunk rather than the logical MP4, a Drama video may be larger than 2 GB without creating any single Telegram file near that size. DMCMS still caps the number of chunks and validates every part checksum/size before making a new video version current.
+
+The legacy multipart `POST /files` endpoint retains its `2,000,000,000`-byte single-file guard for compatibility with older Drama video rows and upstream-style clients.
+
+The service stores ordinary Telegram documents, not Telegram-Drive encrypted `.tdenc` objects, because DMCMS needs efficient HTTP Range playback through its stable playback gateway.
 
 ## Session lifecycle
 

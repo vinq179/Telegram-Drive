@@ -20,10 +20,12 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
+use tokio_util::io::StreamReader;
 
 const TELEGRAM_MAX_FILE_SIZE: u64 = 2_000_000_000;
 const MAX_MULTIPART_METADATA_BYTES: usize = 128;
 const MAX_UPLOAD_FILENAME_CHARS: usize = 255;
+const MAX_DIRECT_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 const CDN_ALIGNMENT: u64 = 524_288;
 const DOWNLOAD_CHUNK_SIZE: i32 = 65_536;
 
@@ -135,6 +137,36 @@ fn sanitise_upload_filename(value: &str) -> String {
     } else {
         cleaned
     }
+}
+
+fn required_content_length(req: &HttpRequest) -> Result<u64, HttpResponse> {
+    let raw = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| json_error("CONTENT_LENGTH_REQUIRED", "Content-Length is required", 411))?;
+    let size = raw
+        .parse::<u64>()
+        .map_err(|_| json_error("INVALID_CONTENT_LENGTH", "Content-Length is invalid", 400))?;
+    if size == 0 {
+        return Err(json_error("FILE_REQUIRED", "A non-empty chunk is required", 400));
+    }
+    if size > MAX_DIRECT_CHUNK_BYTES {
+        return Err(json_error(
+            "CHUNK_TOO_LARGE",
+            format!("Direct upload chunks must be at most {MAX_DIRECT_CHUNK_BYTES} bytes"),
+            413,
+        ));
+    }
+    Ok(size)
+}
+
+fn direct_chunk_filename(req: &HttpRequest) -> String {
+    req.headers()
+        .get("X-File-Name")
+        .and_then(|value| value.to_str().ok())
+        .map(sanitise_upload_filename)
+        .unwrap_or_else(|| "video.part".to_string())
 }
 
 fn api_file_from_message(
@@ -394,6 +426,57 @@ async fn upload_file(
     match state.client.send_message(&peer, message).await {
         Ok(message) => match api_file_from_message(&message, folder_id) {
             Some(file) => HttpResponse::Ok().json(file),
+            None => json_error("UPLOAD_INCOMPLETE", "Telegram returned no media message", 502),
+        },
+        Err(error) => json_error("SEND_FAILED", error.to_string(), 502),
+    }
+}
+
+#[post("/api/v1/files/chunks")]
+async fn upload_chunk(
+    req: HttpRequest,
+    query: web::Query<FolderQuery>,
+    payload: web::Payload,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if let Err(response) = require_auth(&req, state.get_ref()) {
+        return response;
+    }
+    let file_size = match required_content_length(&req) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let filename = direct_chunk_filename(&req);
+    let folder_id = query.folder_id;
+    let peer = match resolve_peer(&state.client, folder_id, &state.peer_cache).await {
+        Ok(peer) => peer,
+        Err(error) => return json_error("PEER_ERROR", error, 400),
+    };
+
+    let stream = payload.map(|item| {
+        item.map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
+    });
+    let mut reader = StreamReader::new(stream);
+    let uploaded = match state
+        .client
+        .upload_stream(&mut reader, file_size as usize, filename.clone())
+        .await
+    {
+        Ok(uploaded) => uploaded,
+        Err(error) => return json_error("UPLOAD_FAILED", error.to_string(), 502),
+    };
+    let message = InputMessage::new().text("").file(uploaded);
+    match state.client.send_message(&peer, message).await {
+        Ok(message) => match api_file_from_message(&message, folder_id) {
+            Some(file) if file.size == file_size => HttpResponse::Ok().json(file),
+            Some(file) => {
+                let _ = state.client.delete_messages(&peer, &[message.id()]).await;
+                json_error(
+                    "SIZE_MISMATCH",
+                    format!("Telegram stored {} bytes, expected {file_size}", file.size),
+                    502,
+                )
+            }
             None => json_error("UPLOAD_INCOMPLETE", "Telegram returned no media message", 502),
         },
         Err(error) => json_error("SEND_FAILED", error.to_string(), 502),
@@ -827,6 +910,7 @@ async fn serve() -> Result<(), String> {
             .service(list_files)
             .service(get_file)
             .service(upload_file)
+            .service(upload_chunk)
             .service(delete_file)
             .service(download_file)
     })
@@ -880,5 +964,29 @@ mod tests {
     fn upload_filename_is_reduced_to_safe_basename() {
         assert_eq!(sanitise_upload_filename("../../episode-1.mp4"), "episode-1.mp4");
         assert_eq!(sanitise_upload_filename(".."), "file");
+    }
+
+    #[test]
+    fn direct_chunk_requires_bounded_content_length() {
+        let valid = actix_web::test::TestRequest::default()
+            .insert_header((CONTENT_LENGTH, "33554432"))
+            .to_http_request();
+        assert_eq!(required_content_length(&valid).unwrap(), 33_554_432);
+
+        let too_large = actix_web::test::TestRequest::default()
+            .insert_header((CONTENT_LENGTH, (MAX_DIRECT_CHUNK_BYTES + 1).to_string()))
+            .to_http_request();
+        assert_eq!(
+            required_content_length(&too_large).unwrap_err().status().as_u16(),
+            413
+        );
+    }
+
+    #[test]
+    fn direct_chunk_filename_is_sanitized_from_header() {
+        let req = actix_web::test::TestRequest::default()
+            .insert_header(("X-File-Name", "../../episode.mp4.part000001"))
+            .to_http_request();
+        assert_eq!(direct_chunk_filename(&req), "episode.mp4.part000001");
     }
 }
