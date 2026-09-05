@@ -13,6 +13,8 @@ The headless runtime intentionally implements only the REST contract DMCMS Drama
 - authenticated `GET /api/v1/files/{message_id}`
 - authenticated `DELETE /api/v1/files/{message_id}`
 - authenticated `GET /api/v1/files/{message_id}/download` with HTTP byte ranges
+- authenticated `PUT/DELETE /api/v1/playback-assets/{asset_id}` for the durable logical-video playback registry
+- origin-key protected `GET /api/v1/playback/{asset_id}/segments/{segment_index}` for fixed 64 MiB CDN origin segments
 
 It does not run Tauri, React, WebDAV, sync, supporter UI, thumbnail generation, encrypted-drive objects, transcoding, or public sharing. New Drama uploads are not staged or transcoded by DMCMS: the browser sends bounded chunks to DMCMS, DMCMS streams each chunk to `/files/chunks`, and this service immediately stores that chunk as an ordinary Telegram document.
 
@@ -20,21 +22,35 @@ It does not run Tauri, React, WebDAV, sync, supporter UI, thumbnail generation, 
 
 ## Production topology
 
+Upload/control traffic remains private:
+
 ```text
 DMCMS API + worker
-    -> private Docker network
+    -> private dmcms_internal Docker network
 telegram-drive:8550
     -> grammers / MTProto
 Telegram
 ```
 
-Do not publish port `8550` on the host and do not put this service behind a public Cloudflare hostname. DMCMS should use:
+Visitor playback bypasses DMCMS entirely:
+
+```text
+Browser
+    -> video.aivaults.top Cloudflare Worker/CDN
+    -> cached 64 MiB segment HIT, or on MISS:
+       telegram-origin.aivaults.top Cloudflare Tunnel
+       -> private dmcms_internal network
+       -> telegram-drive:8550
+       -> Telegram MTProto
+```
+
+Do not publish port `8550` on the host. The origin hostname is only a Cloudflare Tunnel route to the same private container and its playback segment endpoint rejects requests that do not carry the derived origin key. DMCMS continues to use:
 
 ```text
 http://telegram-drive:8550/api/v1
 ```
 
-as the per-site Drama Telegram Drive base URL.
+as the per-site Drama Telegram Drive control/upload base URL. The browser never receives that URL, the Telegram Drive API key, Telegram message IDs, or MTProto session material.
 
 ## First-time setup
 
@@ -106,13 +122,13 @@ Leaving `folder_id` blank stores Drama files in Saved Messages, which is the sim
 
 ## Direct Drama upload and limits
 
-DMCMS Drama currently splits a logical MP4 into 32 MiB chunks. Every chunk becomes one Telegram document and is far below Telegram's per-file limit. The ordered Telegram message IDs and sizes are stored by DMCMS as a provider manifest, and the public playback gateway maps a logical browser byte range onto the required Telegram chunk ranges.
+DMCMS Drama currently splits a logical MP4 into 32 MiB storage chunks. Every chunk becomes one Telegram document and is far below Telegram's per-file limit. After verification DMCMS registers the ordered Telegram parts here as one logical playback asset. The headless service exposes that asset to Cloudflare as immutable 64 MiB origin segments; one logical CDN segment may span multiple Telegram documents. Cloudflare's Worker reconstructs the browser's logical HTTP Range response from those cached segments. DMCMS does not carry visitor video bytes.
 
 Because the provider limit applies to each stored chunk rather than the logical MP4, a Drama video may be larger than 2 GB without creating any single Telegram file near that size. DMCMS still caps the number of chunks and validates every part checksum/size before making a new video version current.
 
 The legacy multipart `POST /files` endpoint retains its `2,000,000,000`-byte single-file guard for compatibility with older Drama video rows and upstream-style clients.
 
-The service stores ordinary Telegram documents, not Telegram-Drive encrypted `.tdenc` objects, because DMCMS needs efficient HTTP Range playback through its stable playback gateway.
+The service stores ordinary Telegram documents, not Telegram-Drive encrypted `.tdenc` objects, because the Cloudflare delivery layer needs efficient segment reads from Telegram without downloading or transcoding a whole MP4 first.
 
 ## Session lifecycle
 

@@ -1,6 +1,6 @@
 [package]
 name = "telegram-drive-headless"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 
@@ -11,6 +11,7 @@ async-stream = "0.3"
 constant_time_eq = "0.3"
 env_logger = "0.11"
 futures = "0.3"
+hmac = "0.12"
 grammers-client = { git = "https://github.com/Lonami/grammers", rev = "d07f96f" }
 grammers-mtsender = { git = "https://github.com/Lonami/grammers", rev = "d07f96f" }
 grammers-session = { git = "https://github.com/Lonami/grammers", rev = "d07f96f" }
@@ -19,6 +20,7 @@ log = "0.4"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }

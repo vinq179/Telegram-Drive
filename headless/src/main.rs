@@ -1,9 +1,10 @@
 use actix_multipart::Multipart;
 use actix_web::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use actix_web::web::Bytes;
-use actix_web::{delete, get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{delete, get, post, put, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use constant_time_eq::constant_time_eq;
 use futures::{StreamExt, TryStreamExt};
+use hmac::{Hmac, Mac};
 use grammers_client::types::{Media, PasswordToken, Peer};
 use grammers_client::{Client, InputMessage};
 use grammers_mtsender::{ConnectionParams, InvocationError, SenderPool};
@@ -12,6 +13,7 @@ use grammers_session::types::{PeerAuth, PeerInfo, UpdateState, UpdatesState};
 use grammers_session::Session;
 use grammers_tl_types as tl;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, Write};
@@ -28,11 +30,16 @@ const MAX_UPLOAD_FILENAME_CHARS: usize = 255;
 const MAX_DIRECT_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 const CDN_ALIGNMENT: u64 = 524_288;
 const DOWNLOAD_CHUNK_SIZE: i32 = 65_536;
+const PLAYBACK_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+const PLAYBACK_ORIGIN_DERIVATION_CONTEXT: &[u8] = b"drama-playback-origin-v1";
 
 #[derive(Clone)]
 struct AppState {
     client: Client,
     api_key: Arc<String>,
+    playback_origin_key: Arc<String>,
+    playback_registry_path: Arc<PathBuf>,
+    playback_registry: Arc<RwLock<HashMap<String, PlaybackAsset>>>,
     peer_cache: Arc<RwLock<HashMap<i64, Peer>>>,
 }
 
@@ -87,6 +94,37 @@ struct FolderQuery {
     folder_id: Option<i64>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct PlaybackAssetPart {
+    message_id: i32,
+    folder_id: Option<i64>,
+    size_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct PlaybackAsset {
+    size_bytes: u64,
+    mime_type: String,
+    etag: String,
+    parts: Vec<PlaybackAssetPart>,
+}
+
+#[derive(Deserialize)]
+struct PlaybackAssetInput {
+    size_bytes: u64,
+    mime_type: String,
+    etag: String,
+    parts: Vec<PlaybackAssetPart>,
+}
+
+#[derive(Serialize)]
+struct PlaybackAssetResponse {
+    asset_id: String,
+    size_bytes: u64,
+    segment_size: u64,
+    segment_count: u64,
+}
+
 fn json_error(code: impl Into<String>, message: impl Into<String>, status: u16) -> HttpResponse {
     let body = ApiError {
         error: ApiErrorDetail {
@@ -114,6 +152,118 @@ fn require_auth(req: &HttpRequest, state: &AppState) -> Result<(), HttpResponse>
     } else {
         Err(json_error("UNAUTHORIZED", "Invalid API key", 401))
     }
+}
+
+fn derive_playback_origin_key(api_key: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(api_key.as_bytes())
+        .expect("HMAC accepts arbitrary key sizes");
+    mac.update(PLAYBACK_ORIGIN_DERIVATION_CONTEXT);
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn require_playback_origin(req: &HttpRequest, state: &AppState) -> Result<(), HttpResponse> {
+    let provided = req
+        .headers()
+        .get("X-Playback-Origin-Key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if provided.len() == state.playback_origin_key.len()
+        && constant_time_eq(provided.as_bytes(), state.playback_origin_key.as_bytes())
+    {
+        Ok(())
+    } else {
+        Err(json_error("UNAUTHORIZED", "Invalid playback origin key", 401))
+    }
+}
+
+fn valid_asset_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn validate_playback_asset(input: PlaybackAssetInput) -> Result<PlaybackAsset, String> {
+    if input.size_bytes == 0 {
+        return Err("Playback asset must be non-empty".to_string());
+    }
+    if input.mime_type.trim().to_ascii_lowercase() != "video/mp4" {
+        return Err("Playback asset must use video/mp4".to_string());
+    }
+    if input.etag.trim().is_empty() || input.etag.len() > 160 {
+        return Err("Playback asset ETag is invalid".to_string());
+    }
+    if input.parts.is_empty() {
+        return Err("Playback asset has no Telegram parts".to_string());
+    }
+    let mut total = 0u64;
+    for part in &input.parts {
+        if part.message_id <= 0 || part.size_bytes == 0 {
+            return Err("Playback asset contains an invalid Telegram part".to_string());
+        }
+        total = total
+            .checked_add(part.size_bytes)
+            .ok_or_else(|| "Playback asset size overflows".to_string())?;
+    }
+    if total != input.size_bytes {
+        return Err("Playback asset part sizes do not match the declared size".to_string());
+    }
+    Ok(PlaybackAsset {
+        size_bytes: input.size_bytes,
+        mime_type: "video/mp4".to_string(),
+        etag: input.etag.trim().to_string(),
+        parts: input.parts,
+    })
+}
+
+fn playback_registry_path() -> PathBuf {
+    env::var("TELEGRAM_PLAYBACK_REGISTRY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/data/playback-registry.json"))
+}
+
+async fn load_playback_registry(path: &Path) -> Result<HashMap<String, PlaybackAsset>, String> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn persist_playback_registry(
+    path: &Path,
+    registry: &HashMap<String, PlaybackAsset>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let payload = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
+    let temp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::fs::rename(&temp_path, path)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn playback_segment_bounds(size_bytes: u64, segment_index: u64) -> Option<(u64, u64)> {
+    let start = segment_index.checked_mul(PLAYBACK_SEGMENT_SIZE)?;
+    if start >= size_bytes {
+        return None;
+    }
+    let end = start
+        .saturating_add(PLAYBACK_SEGMENT_SIZE - 1)
+        .min(size_bytes - 1);
+    Some((start, end))
 }
 
 fn media_size(media: &Media) -> u64 {
@@ -483,6 +633,59 @@ async fn upload_chunk(
     }
 }
 
+#[put("/api/v1/playback-assets/{asset_id}")]
+async fn put_playback_asset(
+    req: HttpRequest,
+    path: web::Path<String>,
+    body: web::Json<PlaybackAssetInput>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if let Err(response) = require_auth(&req, state.get_ref()) {
+        return response;
+    }
+    let asset_id = path.into_inner();
+    if !valid_asset_id(&asset_id) {
+        return json_error("INVALID_ASSET_ID", "Playback asset id is invalid", 400);
+    }
+    let asset = match validate_playback_asset(body.into_inner()) {
+        Ok(asset) => asset,
+        Err(error) => return json_error("INVALID_PLAYBACK_ASSET", error, 422),
+    };
+    let response = PlaybackAssetResponse {
+        asset_id: asset_id.clone(),
+        size_bytes: asset.size_bytes,
+        segment_size: PLAYBACK_SEGMENT_SIZE,
+        segment_count: asset.size_bytes.div_ceil(PLAYBACK_SEGMENT_SIZE),
+    };
+    let mut registry = state.playback_registry.write().await;
+    registry.insert(asset_id, asset);
+    if let Err(error) = persist_playback_registry(&state.playback_registry_path, &registry).await {
+        return json_error("REGISTRY_WRITE_FAILED", error, 500);
+    }
+    HttpResponse::Ok().json(response)
+}
+
+#[delete("/api/v1/playback-assets/{asset_id}")]
+async fn delete_playback_asset(
+    req: HttpRequest,
+    path: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if let Err(response) = require_auth(&req, state.get_ref()) {
+        return response;
+    }
+    let asset_id = path.into_inner();
+    if !valid_asset_id(&asset_id) {
+        return json_error("INVALID_ASSET_ID", "Playback asset id is invalid", 400);
+    }
+    let mut registry = state.playback_registry.write().await;
+    registry.remove(&asset_id);
+    if let Err(error) = persist_playback_registry(&state.playback_registry_path, &registry).await {
+        return json_error("REGISTRY_WRITE_FAILED", error, 500);
+    }
+    HttpResponse::Ok().json(serde_json::json!({"success": true}))
+}
+
 #[delete("/api/v1/files/{message_id}")]
 async fn delete_file(
     req: HttpRequest,
@@ -621,6 +824,147 @@ fn build_media_response(
             format!("inline; filename=\"{}\"", sanitise_upload_filename(filename)),
         ))
         .streaming(stream)
+}
+
+fn build_playback_segment_response(
+    state: &AppState,
+    asset: PlaybackAsset,
+    segment_index: u64,
+) -> HttpResponse {
+    let Some((segment_start, segment_end)) = playback_segment_bounds(asset.size_bytes, segment_index) else {
+        return HttpResponse::RangeNotSatisfiable()
+            .insert_header((CONTENT_RANGE, format!("bytes */{}", asset.size_bytes)))
+            .finish();
+    };
+    let content_length = segment_end - segment_start + 1;
+    let client = state.client.clone();
+    let peer_cache = state.peer_cache.clone();
+    let parts = asset.parts.clone();
+
+    let stream = async_stream::stream! {
+        let mut logical_cursor = 0u64;
+        let mut emitted = 0u64;
+        for part in parts {
+            let part_start = logical_cursor;
+            let part_end = part_start + part.size_bytes - 1;
+            logical_cursor += part.size_bytes;
+            if part_end < segment_start {
+                continue;
+            }
+            if part_start > segment_end {
+                break;
+            }
+            let local_start = segment_start.max(part_start) - part_start;
+            let local_end = segment_end.min(part_end) - part_start;
+            let local_length = local_end - local_start + 1;
+            let peer = match resolve_peer(&client, part.folder_id, &peer_cache).await {
+                Ok(peer) => peer,
+                Err(error) => {
+                    log::error!("Playback peer resolution failed: {error}");
+                    yield Err::<Bytes, actix_web::Error>(actix_web::error::ErrorBadGateway("Playback origin unavailable"));
+                    return;
+                }
+            };
+            let messages = match client.get_messages_by_id(peer, &[part.message_id]).await {
+                Ok(messages) => messages,
+                Err(error) => {
+                    log::error!("Playback message fetch failed: {error}");
+                    yield Err::<Bytes, actix_web::Error>(actix_web::error::ErrorBadGateway("Playback origin unavailable"));
+                    return;
+                }
+            };
+            let Some(message) = messages.first().and_then(|message| message.as_ref()) else {
+                yield Err::<Bytes, actix_web::Error>(actix_web::error::ErrorNotFound("Playback part missing"));
+                return;
+            };
+            let Some(media) = message.media() else {
+                yield Err::<Bytes, actix_web::Error>(actix_web::error::ErrorNotFound("Playback media missing"));
+                return;
+            };
+            if media_size(&media) != part.size_bytes {
+                yield Err::<Bytes, actix_web::Error>(actix_web::error::ErrorBadGateway("Playback part size mismatch"));
+                return;
+            }
+
+            let aligned_start = (local_start / CDN_ALIGNMENT) * CDN_ALIGNMENT;
+            let chunk_index = (aligned_start / DOWNLOAD_CHUNK_SIZE as u64) as i32;
+            let mut download = client.iter_download(&media).chunk_size(DOWNLOAD_CHUNK_SIZE);
+            if chunk_index > 0 {
+                download = download.skip_chunks(chunk_index);
+            }
+            let bytes_to_skip = (local_start - aligned_start) as usize;
+            let mut skipped = 0usize;
+            let mut part_emitted = 0u64;
+            while let Some(next) = download.next().await.transpose() {
+                let mut data = match next {
+                    Ok(data) => data,
+                    Err(error) => {
+                        log::error!("Playback Telegram stream failed: {error}");
+                        yield Err::<Bytes, actix_web::Error>(actix_web::error::ErrorBadGateway("Playback Telegram stream failed"));
+                        return;
+                    }
+                };
+                if skipped < bytes_to_skip {
+                    let remaining_skip = bytes_to_skip - skipped;
+                    if data.len() <= remaining_skip {
+                        skipped += data.len();
+                        continue;
+                    }
+                    data = data[remaining_skip..].to_vec();
+                    skipped = bytes_to_skip;
+                }
+                let remaining = local_length.saturating_sub(part_emitted);
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(data.len() as u64) as usize;
+                if take > 0 {
+                    part_emitted += take as u64;
+                    emitted += take as u64;
+                    yield Ok::<Bytes, actix_web::Error>(Bytes::copy_from_slice(&data[..take]));
+                }
+                if part_emitted >= local_length {
+                    break;
+                }
+            }
+            if part_emitted != local_length {
+                yield Err::<Bytes, actix_web::Error>(actix_web::error::ErrorBadGateway("Playback segment ended early"));
+                return;
+            }
+        }
+        if emitted != content_length {
+            yield Err::<Bytes, actix_web::Error>(actix_web::error::ErrorBadGateway("Playback segment is incomplete"));
+        }
+    };
+
+    HttpResponse::Ok()
+        .insert_header((CONTENT_TYPE, asset.mime_type))
+        .insert_header((CONTENT_LENGTH, content_length.to_string()))
+        .insert_header(("Accept-Ranges", "bytes"))
+        .insert_header(("Cache-Control", "public, max-age=31536000, immutable"))
+        .insert_header(("ETag", format!("\"{}-{}\"", asset.etag, segment_index)))
+        .insert_header(("X-Content-Type-Options", "nosniff"))
+        .streaming(stream)
+}
+
+#[get("/api/v1/playback/{asset_id}/segments/{segment_index}")]
+async fn playback_segment(
+    req: HttpRequest,
+    path: web::Path<(String, u64)>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if let Err(response) = require_playback_origin(&req, state.get_ref()) {
+        return response;
+    }
+    let (asset_id, segment_index) = path.into_inner();
+    if !valid_asset_id(&asset_id) {
+        return json_error("INVALID_ASSET_ID", "Playback asset id is invalid", 400);
+    }
+    let asset = state.playback_registry.read().await.get(&asset_id).cloned();
+    let Some(asset) = asset else {
+        return json_error("NOT_FOUND", "Playback asset not found", 404);
+    };
+    build_playback_segment_response(state.get_ref(), asset, segment_index)
 }
 
 #[get("/api/v1/files/{message_id}/download")]
@@ -897,9 +1241,15 @@ async fn serve() -> Result<(), String> {
         return Err("Telegram session is not authorized. Run the `login` command first.".to_string());
     }
     let bind = env::var("TELEGRAM_DRIVE_BIND").unwrap_or_else(|_| "0.0.0.0:8550".to_string());
+    let registry_path = playback_registry_path();
+    let registry = load_playback_registry(&registry_path).await?;
+    let playback_origin_key = derive_playback_origin_key(&api_key);
     let state = AppState {
         client: connection.client,
         api_key: Arc::new(api_key),
+        playback_origin_key: Arc::new(playback_origin_key),
+        playback_registry_path: Arc::new(registry_path),
+        playback_registry: Arc::new(RwLock::new(registry)),
         peer_cache: Arc::new(RwLock::new(HashMap::new())),
     };
     log::info!("Telegram Drive headless listening on {bind}");
@@ -911,6 +1261,9 @@ async fn serve() -> Result<(), String> {
             .service(get_file)
             .service(upload_file)
             .service(upload_chunk)
+            .service(put_playback_asset)
+            .service(delete_playback_asset)
+            .service(playback_segment)
             .service(delete_file)
             .service(download_file)
     })
@@ -964,6 +1317,50 @@ mod tests {
     fn upload_filename_is_reduced_to_safe_basename() {
         assert_eq!(sanitise_upload_filename("../../episode-1.mp4"), "episode-1.mp4");
         assert_eq!(sanitise_upload_filename(".."), "file");
+    }
+
+    #[test]
+    fn playback_origin_key_is_deterministic_and_scoped() {
+        let first = derive_playback_origin_key("abcdefghijklmnopqrstuvwxyz123456");
+        let second = derive_playback_origin_key("abcdefghijklmnopqrstuvwxyz123456");
+        let other = derive_playback_origin_key("abcdefghijklmnopqrstuvwxyz654321");
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn playback_asset_validation_requires_exact_part_size_sum() {
+        let valid = validate_playback_asset(PlaybackAssetInput {
+            size_bytes: 10,
+            mime_type: "video/mp4".to_string(),
+            etag: "version-1".to_string(),
+            parts: vec![
+                PlaybackAssetPart { message_id: 1, folder_id: None, size_bytes: 6 },
+                PlaybackAssetPart { message_id: 2, folder_id: Some(9), size_bytes: 4 },
+            ],
+        })
+        .unwrap();
+        assert_eq!(valid.size_bytes, 10);
+        assert_eq!(valid.parts.len(), 2);
+
+        let invalid = validate_playback_asset(PlaybackAssetInput {
+            size_bytes: 11,
+            mime_type: "video/mp4".to_string(),
+            etag: "version-1".to_string(),
+            parts: valid.parts,
+        });
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn playback_segments_are_fixed_and_bounded() {
+        assert_eq!(playback_segment_bounds(PLAYBACK_SEGMENT_SIZE * 2 + 7, 0), Some((0, PLAYBACK_SEGMENT_SIZE - 1)));
+        assert_eq!(
+            playback_segment_bounds(PLAYBACK_SEGMENT_SIZE * 2 + 7, 2),
+            Some((PLAYBACK_SEGMENT_SIZE * 2, PLAYBACK_SEGMENT_SIZE * 2 + 6))
+        );
+        assert_eq!(playback_segment_bounds(PLAYBACK_SEGMENT_SIZE * 2 + 7, 3), None);
     }
 
     #[test]
