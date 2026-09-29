@@ -74,7 +74,7 @@ RUST_LOG=info
 
 ```bash
 cd headless
-./deploy.sh <git-commit>
+./deploy.sh <full-40-character-origin-main-sha>
 ```
 
 On a new host the deploy script builds the image, verifies the private `dmcms_internal` Docker network and then stops safely if the Telegram session has not been bootstrapped yet.
@@ -90,7 +90,7 @@ The command prompts for the Telegram phone number, login code, and 2FA password 
 3. Rerun deployment:
 
 ```bash
-./deploy.sh <git-commit>
+./deploy.sh <full-40-character-origin-main-sha>
 ```
 
 The service then starts on the shared private Docker network with no host `ports:` mapping. The deploy script waits for Docker health before succeeding.

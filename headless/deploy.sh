@@ -4,15 +4,22 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 revision="${1:-}"
-if [[ -z "$revision" ]]; then
-  echo "usage: ./deploy.sh <git-commit> [env-file]" >&2
+if [[ ! "$revision" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  echo "usage: ./deploy.sh <full-40-character-origin-main-sha> [env-file]" >&2
   exit 2
 fi
 
 env_file="${2:-/home/vinq179/runtime/secrets/telegram-drive.env}"
 
-if [[ -n "$(git -C .. status --porcelain)" ]]; then
-  echo "[deploy] Refusing dirty Telegram-Drive worktree." >&2
+command -v flock >/dev/null 2>&1 || { echo "[deploy] flock is required." >&2; exit 1; }
+exec 9>/tmp/aivaults-telegram-drive-headless-deploy.lock
+if ! flock -n 9; then
+  echo "[deploy] Another Telegram Drive headless deploy is already running." >&2
+  exit 1
+fi
+
+if [[ -n "$(git -C .. status --porcelain --untracked-files=all)" ]]; then
+  echo "[deploy] Refusing dirty Telegram-Drive worktree; preserve/reconcile drift explicitly." >&2
   exit 1
 fi
 
@@ -29,6 +36,11 @@ fi
 
 git -C .. fetch --prune origin
 git -C .. cat-file -e "${revision}^{commit}"
+origin_main="$(git -C .. rev-parse origin/main)"
+if [[ "${origin_main,,}" != "${revision,,}" ]]; then
+  echo "[deploy] Requested SHA $revision is not current origin/main $origin_main." >&2
+  exit 1
+fi
 git -C .. checkout --detach "$revision"
 
 actual_revision="$(git -C .. rev-parse HEAD)"
