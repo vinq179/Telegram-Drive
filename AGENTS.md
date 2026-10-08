@@ -18,11 +18,21 @@ Pricing, entitlement rights, device limits, signing-key strategy, stable credent
 
 Any in-scope change must preserve the automated checks listed in `SUPPORTER_LICENSE_INVARIANTS.md`. A live PayPal transaction, production deployment, signing-key rotation, entitlement revocation, or production D1 mutation requires explicit authorization; do not infer it from a general implementation request.
 
-## Canonical Git / Release Flow
+## AIVaults Golden Release Flow
 
-- Mỗi task/agent dùng clean worktree + branch riêng từ latest `origin/main`; test, commit đúng intended files và push feature ref.
-- Release owner merge only committed/pushed refs trong clean Integration/Release worktree từ latest `origin/main`, chạy final gates trên merged tree, fetch main lại trước push và không force-push.
-- `origin/main` là release source of truth duy nhất. Headless deploy chỉ nhận full 40-character SHA đúng bằng current `origin/main`, dùng lock, từ chối dirty runtime tree và checkout detached exact SHA.
-- Không SCP/copy source thủ công hoặc stash/reset/clean production drift để ép deploy.
-- `deploy` = deploy intended current canonical release theo exact-SHA flow; `cp deploy` = commit + push intended changes -> integrate/verify -> push `origin/main` -> deploy exact resulting SHA.
-- Quy tắc này **không thay thế approval boundary ở trên**: live PayPal action, production deployment, signing-key rotation, entitlement revocation và production D1 mutation vẫn cần user explicit authorization trong task hiện tại. Một yêu cầu trực tiếp như “deploy đi” hoặc “cp deploy” là authorization cho deploy đó; không được suy diễn deployment từ một yêu cầu implementation chung.
+The repository has two release profiles and both start from the same canonical `origin/main` revision:
+
+- **Desktop/Android binaries:** GitHub Actions builds/signs the exact release commit/tag and publishes immutable signed artifacts through GitHub Releases. Do not create a production release from an untracked local binary. Existing signing/entitlement approval rules above remain authoritative.
+- **AIVaults headless service:** GitHub Actions/CI must build the headless container exactly once, push it to the configured registry (GHCR by default), and pin it by immutable digest. Staging/DMCMS integration validates that digest first; production pulls the same digest and does not build source on the host.
+
+Shared rules:
+
+- Task agents use isolated clean worktrees/branches; one release owner integrates only pushed refs in a clean Integration/Release worktree from latest `origin/main` and reruns final gates.
+- Fetch main again before publish; if it moved, re-integrate/reverify and never force-push.
+- Production/headless runtime does not use blind `git pull`, SCP/rsync, manual source edits, or build-on-prod as the normal release path.
+- Runtime Telegram session, API credentials, signing keys, release state, and backups remain outside Git; drift fails closed.
+- Headless DB/state changes, if any, require backup + one-shot compatible migration before candidate cutover.
+- Long-running headless rollout should be Blue/Green or equivalent health-gated switch with previous digest retained for rollback.
+- The current `headless/deploy.sh` build-on-host behavior is transitional. It may be used only with explicit temporary legacy authorization until CI image publishing/promotion is implemented; it is not “deploy chuẩn”.
+- `deploy` or `cp deploy` still requires the explicit production authorization boundary stated above.
+- Release recap must name exact Git SHA/tag, signed artifact checksum or image digest, validation result, production result, and rollback state.\n

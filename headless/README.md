@@ -52,6 +52,17 @@ http://telegram-drive:8550/api/v1
 
 as the per-site Drama Telegram Drive control/upload base URL. The browser never receives that URL, the Telegram Drive API key, Telegram message IDs, or MTProto session material.
 
+## Canonical release policy
+
+The headless production target follows the container Golden Release Flow:
+
+```text
+origin/main -> GitHub Actions/CI builds headless image ONCE -> registry immutable digest
+-> DMCMS/staging validates exact digest -> production pulls same digest -> health -> rollback-ready
+```
+
+The production host must not compile/build the headless service in the normal release path. Telegram session and API credentials remain external runtime state. The current `deploy.sh <sha>` build-on-host procedure below is transitional/bootstrap-only and requires explicit temporary legacy authorization until CI image publishing/promotion replaces it.
+
 ## First-time setup
 
 Production keeps runtime credentials outside the Git checkout. The default runbook expects:
@@ -70,7 +81,7 @@ RUST_LOG=info
 
 `TELEGRAM_API_HASH` is intentionally not kept in the service environment. It is needed only while bootstrapping a Telegram session.
 
-1. Build/deploy the exact Git revision:
+1. **Legacy/bootstrap only:** build/deploy the exact Git revision:
 
 ```bash
 cd headless
