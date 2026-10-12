@@ -1,0 +1,27 @@
+# Source CI only. Does NOT replace platform-signed desktop/Android release,
+# supporter-service production Worker deploy, or independent D1/R2 backups.
+when:
+  - event: push
+    branch: [main, "integration/**"]
+  - event: pull_request
+
+steps:
+  - name: supporter-compatibility
+    image: node:22-bookworm
+    commands:
+      - |
+        set -eu
+        cd supporter-service
+        npm ci --no-audit --no-fund
+        npm run check
+        npm test
+        npx wrangler deploy --dry-run
+
+  - name: client-unit-tests
+    image: node:22-bookworm
+    commands:
+      - |
+        set -eu
+        cd app
+        npm ci --no-audit --no-fund
+        npm test -- --run tests/unit/SupporterContext.test.tsx tests/unit/SupporterSettingsSection.test.tsx tests/unit/MobileSupporterCard.test.tsx tests/unit/supporterVisibility.test.ts tests/unit/sponsorLinks.test.ts

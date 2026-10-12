@@ -22,8 +22,8 @@ Any in-scope change must preserve the automated checks listed in `SUPPORTER_LICE
 
 The repository has two release profiles and both start from the same canonical `origin/main` revision:
 
-- **Desktop/Android binaries:** GitHub Actions builds/signs the exact release commit/tag and publishes immutable signed artifacts through GitHub Releases. Do not create a production release from an untracked local binary. Existing signing/entitlement approval rules above remain authoritative.
-- **AIVaults headless service:** GitHub Actions/CI must build the headless container exactly once, push it to the configured registry (GHCR by default), and pin it by immutable digest. Staging/DMCMS integration validates that digest first; production pulls the same digest and does not build source on the host.
+- **Desktop/Android binaries:** retain the existing platform signing/installer/Android and supporter backup/Worker workflows until a separately verified replacement exists; they remain an explicit exception to the generic Woodpecker-only app-image flow. Do not create releases from untracked local binaries or alter signing keys/supporter entitlements.
+- **AIVaults headless service:** new release must be built **once by Woodpecker on videv** into the private mTLS LAN Registry and pinned by immutable digest, with DMCMS-compatible staging and single-writer/session-aware rollback. Source-only CI prepared in this repo is not a qualified headless image release: block production until an actual pipeline and promotion runbook pass.
 
 Shared rules:
 

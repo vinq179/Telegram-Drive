@@ -20,6 +20,8 @@ Organize, transfer, preview, stream, sync, and share the files you keep in Saved
 
 </div>
 
+> **AIVaults fork release:** read [Woodpecker and signed-client runbook](docs/woodpecker-release.md) before a release. Headless/DMCMS integration is distinct from platform-signed desktop/Android packages, supporter Worker and backup jobs. Preserve the established supporter license and existing signing flows until replacements are verified.
+
 ![Telegram Drive desktop dashboard](Docs/assets/dashboard.webp)
 
 Telegram Drive turns Telegram's familiar file storage into a focused, desktop-style workspace. The app connects directly to Telegram with credentials you provide; it does not run a separate file-storage or relay service. Every application feature is available without payment.
