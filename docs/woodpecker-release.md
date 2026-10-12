@@ -8,4 +8,4 @@ Multi-agent integration must use isolated task worktrees and merge only pushed s
 
 **DO NOT DELETE** GitHub Actions for signed platforms, supporter D1 backup, or the Cloudflare Worker until equivalent signed/artifact and disaster-recovery jobs have passed. Never rotate license keys or change the $5 lifetime supporter promise as part of CI migration.
 
-Status: CI quality prepared locally only; no Woodpecker-to-production qualification.
+Status: CI Quality/runbook committed/pushed to a **feature branch only**; the 11 special GitHub Actions (signed packages, backups, Cloudflare Worker and deeper tests) deliberately remain active on main until equivalent replacement gates pass. No Woodpecker-to-production qualification.
