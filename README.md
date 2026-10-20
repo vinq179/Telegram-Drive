@@ -6,6 +6,8 @@
 
 ### A local-first file workspace powered by your own Telegram account
 
+> **AIVaults headless FAST DEV (2026-10-20):** Owner command `Merge Telegram Drive` is intended to integrate selected pushed refs and update the hosted headless service with exact-SHA/Telegram-session-safe smoke in one operation. Its fast adapter is **pending verification**; a Git merge is not a live update. Native desktop/Android signed releases are separate. The old Golden CI/CD remains available for an explicit stable release. Details: `AGENTS.md`.
+
 Organize, transfer, preview, stream, sync, and share the files you keep in Saved Messages and Telegram channels—on Windows, macOS, Linux, Android, and Google TV.
 
 [![Latest release](https://img.shields.io/github/v/release/caamer20/Telegram-Drive?display_name=tag&sort=semver)](https://github.com/caamer20/Telegram-Drive/releases/latest)
